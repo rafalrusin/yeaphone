@@ -2,7 +2,7 @@
  *
  *  File: lpcontrol.c
  *
- *  Copyright (C) 2006, 2007  Thomas Reitmayr <treitmayr@devbase.at>
+ *  Copyright (C) 2006 - 2008  Thomas Reitmayr <treitmayr@devbase.at>
  *
  ****************************************************************************
  *
@@ -42,6 +42,7 @@
 #include "mediastreamer2/mediastream.h"
 */
 #include "lpcontrol.h"
+#include "yldisp.h"
 #include "ypmainloop.h"
 
 #ifdef HAVE_CONFIG_H
@@ -204,7 +205,8 @@ void lpcontrol_timer_callback(int id, int group, void *private_data) {
 /*****************************************************************/
 
 void lpstates_callback_wrapper(struct _LinphoneCore *lc,
-                               LinphoneGeneralState *gstate) {
+                               LinphoneGeneralState *gstate)
+{
   if (gstate->new_state == GSTATE_POWER_OFF)
     yp_ml_remove_event(-1, LPCONTROL_TIMER_ID);
 
@@ -214,15 +216,25 @@ void lpstates_callback_wrapper(struct _LinphoneCore *lc,
 
 /*****************************************************************/
 
-void set_lpstates_callback(GeneralStateChange callback) {
+void set_lpstates_callback(GeneralStateChange callback) 
+{
   lpstates_data.callback = callback;
 }
 
 /*****************************************************************/
 
-void lpstates_submit_command(lpstates_command_t command, char *arg) {
+void set_call_received_callback(InviteReceivedCb callback)
+{
+  lpc_vtable.inv_recv = callback;
+}
+
+/*****************************************************************/
+
+void lpstates_submit_command(lpstates_command_t command, char *arg)
+{
   char *cp = arg;
   int level;
+  yl_models_t model;
   
   /*printf("command %d with arg '%s'\n", command, arg);*/
   
@@ -232,6 +244,11 @@ void lpstates_submit_command(lpstates_command_t command, char *arg) {
                                     lpcontrol_timer_callback, &lpstates_data);
       linphone_core_init(&(lpstates_data.core_state), lpstates_data.vtable,
                          lpstates_data.configfile_name, &lpstates_data);
+      model = get_yldisp_model();
+      if ((model == YL_MODEL_P1K) || (model == YL_MODEL_P1KH)) {
+        /* we use the ringer on the handset */
+        linphone_core_set_ring(&(lpstates_data.core_state), "/dev/null");
+      }
       break;
       
     case LPCOMMAND_SHUTDOWN:

@@ -2,7 +2,7 @@
  *
  *  File: ylcontrol.c
  *
- *  Copyright (C) 2006, 2007  Thomas Reitmayr <treitmayr@devbase.at>
+ *  Copyright (C) 2006 - 2008  Thomas Reitmayr <treitmayr@devbase.at>
  *
  ****************************************************************************
  *
@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <linux/input.h>
 
 #include <linphone/linphonecore.h>
@@ -37,6 +38,7 @@
 #include "lpcontrol.h"
 #include "ylcontrol.h"
 #include "ypconfig.h"
+#include "ypmainloop.h"
 
 #ifdef DMALLOC
 #include <dmalloc.h>
@@ -64,6 +66,7 @@ typedef struct ylcontrol_data_s {
   char *natl_access_code;
   
   int hard_shutdown;
+  int linphone_2_1_1_bug;
 } ylcontrol_data_t;
 
 ylcontrol_data_t ylcontrol_data;
@@ -184,11 +187,11 @@ void extract_callernum(ylcontrol_data_t *ylc_ptr, const char *line) {
 /**********************************/
 
 /* callerid to ringtone name */
-unsigned char *callerid2ringtone(const char *dialnum)
+static char *callerid2ringtone(const char *dialnum)
 {
   char *calleridkey;
   char *keyprefix = "ringtone_";
-  unsigned char *ringtone;
+  char *ringtone;
   
   calleridkey = malloc(strlen(keyprefix) + strlen(dialnum) + 1);
   strcpy(calleridkey, keyprefix);
@@ -198,9 +201,9 @@ unsigned char *callerid2ringtone(const char *dialnum)
   return ringtone;
 }
 
-void load_custom_ringtone(const char *callernum) 
+static void load_custom_ringtone(const char *callernum) 
 {
-  unsigned char *ringtone, *ringtone_distinctive = NULL;
+  char *ringtone, *ringtone_distinctive = NULL;
   
   if (callernum && strlen(callernum))
   {
@@ -215,11 +218,53 @@ void load_custom_ringtone(const char *callernum)
   if (ringtone) {
     /* upload custom ringtone based on callerid */
     printf("setting ring tone to %s\n", ringtone);
-    set_yldisp_set_ringtone(ringtone, 250);
+    set_yldisp_ringtone(ringtone, 250);
   }
 }
 
-//**********************************/
+/***********************************/
+
+/* callerid to minimum ring duration in [ms] */
+static int callerid2minring(const char *dialnum)
+{
+  char *calleridkey;
+  char *keyprefix = "minring_";
+  char *minring_str;
+  int minring = 0;
+  
+  calleridkey = malloc(strlen(keyprefix) + strlen(dialnum) + 1);
+  strcpy(calleridkey, keyprefix);
+  strcat(calleridkey, dialnum);
+  minring_str = ypconfig_get_value(calleridkey);
+  free(calleridkey);
+  if (minring_str) {
+    minring = atoi(minring_str);
+    if (minring >= 0)
+      minring *= 1000;
+    else
+      minring = 0;
+  }
+  else
+    minring = -1;
+
+  return minring;
+}
+
+static int get_custom_minring(const char *callernum)
+{
+  int minring;
+
+  if (callernum && strlen(callernum))
+    minring = callerid2minring(callernum);
+  if (minring < 0)
+    minring = callerid2minring("default");
+  if (minring < 0)
+    minring = 0;
+
+  return minring;
+}
+
+/***********************************/
 
 void handle_key(ylcontrol_data_t *ylc_ptr, int code, int value) {
   char c;
@@ -329,7 +374,7 @@ void handle_key(ylcontrol_data_t *ylc_ptr, int code, int value) {
           else
           if (lpstate_call == GSTATE_CALL_IN_INVITE &&
               c == '#') {
-            set_yldisp_ringer(YL_RINGER_OFF);
+            set_yldisp_ringer(YL_RINGER_OFF, 0);
           }
           break;
 
@@ -385,6 +430,7 @@ void handle_key(ylcontrol_data_t *ylc_ptr, int code, int value) {
         case 1:          /* hang up */
           if (lpstate_power != GSTATE_POWER_ON)
             break;
+          set_yldisp_ringer(YL_RINGER_OFF, 0);
           if (lpstate_call == GSTATE_CALL_OUT_INVITE ||
               lpstate_call == GSTATE_CALL_OUT_CONNECTED ||
               lpstate_call == GSTATE_CALL_IN_INVITE ||
@@ -479,10 +525,16 @@ void lps_callback(struct _LinphoneCore *lc,
   gstate_t lpstate_power;
   gstate_t lpstate_call;
   gstate_t lpstate_reg;
+  yl_models_t model;
+  
+  /* make sure this is the same thread as our main loop! */
+  assert(yp_ml_same_thread());
   
   lpstate_power = gstate_get_state(GSTATE_GROUP_POWER);
   lpstate_call = gstate_get_state(GSTATE_GROUP_CALL);
   lpstate_reg = gstate_get_state(GSTATE_GROUP_REG);
+  
+  model = get_yldisp_model();
   
   switch (gstate->new_state) {
     case GSTATE_POWER_OFF:
@@ -506,6 +558,12 @@ void lps_callback(struct _LinphoneCore *lc,
     case GSTATE_REG_FAILED:
       if (lpstate_power != GSTATE_POWER_ON)
         break;
+      if (ylcontrol_data.linphone_2_1_1_bug &&
+          !strcmp(gstate->message, "Authentication required")) {
+        /* force GSTATE_REG_OK */
+        gstate_new_state(lc, GSTATE_REG_OK, NULL);
+        break;
+      }
       if (lpstate_call == GSTATE_CALL_IDLE) {
         if (ylcontrol_data.dialnum[0] == '\0') {
           set_yldisp_text("-reg failed-");
@@ -545,6 +603,18 @@ void lps_callback(struct _LinphoneCore *lc,
       break;
       
     case GSTATE_CALL_IN_INVITE:
+      /* In linphone <= 2.1.1 there is a bug which causes the message
+       * field to be NULL, the actual caller ID has to be captured in
+       * call_received_callback().
+       */
+      if (gstate->message == NULL) {
+        if (!ylcontrol_data.linphone_2_1_1_bug) {
+          ylcontrol_data.linphone_2_1_1_bug = 1;
+          printf("Warning: A liblinphone bug was detected, please consider\n"
+                 "         patching or upgrading linphone to > 2.1.1!\n");
+        }
+        break;
+      }
       extract_callernum(&ylcontrol_data, gstate->message);
       load_custom_ringtone(ylcontrol_data.callernum);
       if (strlen(ylcontrol_data.callernum)) {
@@ -559,16 +629,18 @@ void lps_callback(struct _LinphoneCore *lc,
       
       set_yldisp_call_type(YL_CALL_IN);
       yldisp_led_blink(300, 300);
-      
-      /* ringing seems to block displaying line 3,
-       * so we have to wait for about 170ms.
-       * This seems to be a limitation of the hardware */
-      usleep(170000);
-      set_yldisp_ringer(YL_RINGER_ON);
+
+      if (get_yldisp_model() == YL_MODEL_P1K) {
+        /* ringing seems to block displaying line 3,
+         * so we have to wait for about 170ms.
+         * This seems to be a limitation of the hardware */
+        usleep(170000);
+      }
+      set_yldisp_ringer(YL_RINGER_ON, get_custom_minring(ylcontrol_data.callernum));
       break;
       
     case GSTATE_CALL_IN_CONNECTED:
-      set_yldisp_ringer(YL_RINGER_OFF);
+      set_yldisp_ringer(YL_RINGER_OFF, 0);
       /* start timer */
       yldisp_start_counter();
       yldisp_led_blink(1000, 100);
@@ -588,7 +660,7 @@ void lps_callback(struct _LinphoneCore *lc,
       break;
       
     case GSTATE_CALL_END:
-      set_yldisp_ringer(YL_RINGER_OFF);
+      set_yldisp_ringer(YL_RINGER_OFF_DELAYED, 0);
       set_yldisp_call_type(YL_CALL_NONE);
       display_dialnum(ylcontrol_data.dialback);
       yldisp_show_date();
@@ -596,6 +668,7 @@ void lps_callback(struct _LinphoneCore *lc,
       break;
       
     case GSTATE_CALL_ERROR:
+      set_yldisp_ringer(YL_RINGER_OFF, 0);
       ylcontrol_data.dialback[0] = '\0';
       set_yldisp_call_type(YL_CALL_NONE);
       set_yldisp_text(" - error -  ");
@@ -605,6 +678,21 @@ void lps_callback(struct _LinphoneCore *lc,
       
     default:
       break;
+  }
+}
+
+/**********************************/
+
+void call_received_callback(struct _LinphoneCore *lc, const char *from)
+{
+  if (ylcontrol_data.linphone_2_1_1_bug) {
+    /* fake a second "general-state" callback */
+    LinphoneGeneralState gstate;
+    gstate.old_state = GSTATE_CALL_IDLE;
+    gstate.new_state = GSTATE_CALL_IN_INVITE;
+    gstate.group = GSTATE_GROUP_CALL;
+    gstate.message = from;
+    lps_callback(lc, &gstate);
   }
 }
 
@@ -627,9 +715,15 @@ void ylcontrol_io_callback(int id, int group, void *private_data) {
   bytes = read(ylc_ptr->evfd, &event, sizeof(struct input_event));
 
   if (bytes != (int) sizeof(struct input_event)) {
-    fprintf(stderr, "control_proc: Expected %d bytes, got %d bytes\n",
-            sizeof(struct input_event), bytes);
-    abort();
+    if (bytes < 0)
+      perror("Error reading from event device");
+    else
+      fprintf(stderr, "%s: Expected %d bytes, got %d bytes\n", __FUNCTION__,
+              sizeof(struct input_event), bytes);
+    close(ylc_ptr->evfd);
+    /* remove myself and shut down */
+    yp_ml_remove_event(-1, YLCONTROL_IO_ID);
+    stop_ylcontrol();
   }
 
   if (event.type == 1) {        /* key */
@@ -650,7 +744,8 @@ void init_ylcontrol(char *countrycode) {
   int modified = 0;
   
   set_lpstates_callback(lps_callback);
-  
+  set_call_received_callback(call_received_callback);
+
   ylcontrol_data.intl_access_code = ypconfig_get_value("intl-access-code");
   if (!ylcontrol_data.intl_access_code) {
     ylcontrol_data.intl_access_code = "00";
@@ -681,6 +776,7 @@ void start_ylcontrol() {
   char *path_event;
   
   ylcontrol_data.hard_shutdown = 0;
+  ylcontrol_data.linphone_2_1_1_bug = 0;
   
   path_event = get_yldisp_event_path();
   

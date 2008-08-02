@@ -2,7 +2,7 @@
  *
  *  File: lpcontrol.h
  *
- *  Copyright (C) 2006  Thomas Reitmayr <treitmayr@yahoo.com>
+ *  Copyright (C) 2006  Thomas Reitmayr <treitmayr@devbase.at>
  *
  ****************************************************************************
  *
@@ -47,6 +47,7 @@ typedef enum lpstates_command_e {
 
 
 void set_lpstates_callback(GeneralStateChange callback);
+void set_call_received_callback(InviteReceivedCb callback);
 
 void start_lpcontrol(int autoregister, void *userdata);
 
