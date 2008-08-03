@@ -134,7 +134,7 @@ struct Cursor {
     char cursor;
 };
 
-enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL};
+enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL, VOIP_STATUS_PANEL};
 
 struct HistoryItem {
     char number[12];
@@ -160,7 +160,7 @@ struct {
 } menuItemDesc[] = { 
 {"search", SEARCH_PANEL},
 {"history", HISTORY_PANEL},
-{"voip status", DIAL_PANEL}
+{"voip status", VOIP_STATUS_PANEL}
 };
 
 const char *HISTORY_FILE=".yeaphone_history";
@@ -198,6 +198,11 @@ struct HistoryPanel {
     enum MainPanelItem switchTo;
     struct DialPanel *dialPanel;
 };
+    
+struct VoipStatusPanel {
+    struct VoipEvent voip;
+    enum MainPanelItem switchTo;
+};
 
 struct MainPanel {
     enum MainPanelItem enabled;
@@ -206,12 +211,33 @@ struct MainPanel {
     struct CallPanel callPanel;
     struct MenuPanel menuPanel;
     struct HistoryPanel historyPanel;
+    struct VoipStatusPanel voipStatusPanel;
 };
+
+struct EnumDesc {
+    int state;
+    const char *desc;
+};
+
+struct EnumDesc voipStatusDesc[] = {
+        {GSTATE_REG_OK, "registered"},
+        {GSTATE_REG_FAILED, "failed"},
+        {0,0}
+    };
+
 
 void sendPipeEvent(struct PipeEvent *p) {
     fprintf(stderr,"before send %i %i\n",eventPipe[0], eventPipe[1]);
     write(eventPipe[1], p, sizeof(*p));
     fprintf(stderr,"after send\n");
+}
+
+const char *getEnumDesc(int state, struct EnumDesc *desc) {
+    int i;
+    for(i=0;desc[i].desc != 0;i++) {
+        if (state == desc[i].state) return desc[i].desc;
+    }
+    return "";
 }
 
 long long timevalToLL(struct timeval *v) {
@@ -319,6 +345,24 @@ void numberEditEvent(struct Event *event, struct NumberEdit *numberEdit) {
                  default:break;
     }
 }
+
+void voipStatusPanelEvent(struct Event *event, struct VoipStatusPanel *voipStatus) {
+    switch (event->type) {
+        case INIT: {
+        } break;
+        case PAINT: {
+            snprintf(event->paint.display->text, 13, "%s", getEnumDesc(voipStatus->voip.reg, voipStatusDesc));
+        } break;
+        case KEY: {
+            if (event->key.value) {
+                voipStatus->switchTo = DIAL_PANEL;
+            }
+        } break;
+        default:break;
+    }
+    
+}
+
 
 void dialPanelEvent(struct Event *event, struct DialPanel *dialPanel) {
     numberEditEvent(event, &dialPanel->numberEdit);
@@ -503,23 +547,13 @@ void menuPanelEvent(struct Event *event, struct MenuPanel *menuPanel) {
 }
 
 
-struct {
-    int state;
-    const char *desc;
-} lpstateDesc[] = {
+struct EnumDesc callStateDesc[] = {
     {GSTATE_CALL_OUT_CONNECTED, "     "},
     {GSTATE_CALL_IN_CONNECTED, "     "},
     {GSTATE_CALL_IN_INVITE, "     "},
-    {GSTATE_CALL_OUT_INVITE, "calling"}
+    {GSTATE_CALL_OUT_INVITE, "calling"},
+    {0,0}
 };
-
-const char *getLPStateDesc(int state) {
-    int i;
-    for(i=0;i<sizeof(lpstateDesc)/sizeof(*lpstateDesc);i++) {
-        if (state == lpstateDesc[i].state) return lpstateDesc[i].desc;
-    }
-    return "    ";
-}
 
 void storeCalledNumber(struct HistoryItem *item) {
     FILE *f=fopen(HISTORY_FILE, "ab");
@@ -534,7 +568,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
             callPanel->callState = -1;
         } break;
         case PAINT: {
-            const char *desc = getLPStateDesc(callPanel->callState);
+            const char *desc = getEnumDesc(callPanel->callState, callStateDesc);
             snprintf(event->paint.display->text, 13, "%s", desc);
         } break;
         case KEY: {
@@ -579,6 +613,7 @@ void mainPanelChildEvent(struct Event *event, struct MainPanel *mainPanel) {
         case CALL_PANEL: callPanelEvent(event, &mainPanel->callPanel); break;
         case SEARCH_PANEL: searchPanelEvent(event, &mainPanel->searchPanel); break;
         case HISTORY_PANEL: historyPanelEvent(event, &mainPanel->historyPanel); break;
+        case VOIP_STATUS_PANEL: voipStatusPanelEvent(event, &mainPanel->voipStatusPanel); break;
         case NONE: assert(0);
     }
 }
@@ -603,6 +638,7 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
     }
     if (event->type == VOIP) {
         //fprintf(stderr,"VOIP\n");
+        mainPanel->voipStatusPanel.voip = event->voip;
         switch (event->voip.call) {
             case GSTATE_CALL_OUT_CONNECTED:
             case GSTATE_CALL_IN_CONNECTED:
@@ -631,7 +667,11 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
         case MENU_PANEL: mainPanelSwitchTo(&mainPanel->menuPanel.switchTo, event, mainPanel); break;
         case SEARCH_PANEL: mainPanelSwitchTo(&mainPanel->searchPanel.switchTo, event, mainPanel); break;
         case HISTORY_PANEL: mainPanelSwitchTo(&mainPanel->historyPanel.switchTo, event, mainPanel); break;
-        default:break;
+        case VOIP_STATUS_PANEL: mainPanelSwitchTo(&mainPanel->voipStatusPanel.switchTo, event, mainPanel); break;
+
+        case NONE:
+        case CALL_PANEL:
+        break;
     }
 }
 
