@@ -548,9 +548,9 @@ void menuPanelEvent(struct Event *event, struct MenuPanel *menuPanel) {
 
 
 struct EnumDesc callStateDesc[] = {
-    {GSTATE_CALL_OUT_CONNECTED, "     "},
-    {GSTATE_CALL_IN_CONNECTED, "     "},
-    {GSTATE_CALL_IN_INVITE, "     "},
+    {GSTATE_CALL_OUT_CONNECTED, "answered"},
+    {GSTATE_CALL_IN_CONNECTED, "answered"},
+    {GSTATE_CALL_IN_INVITE, "ringing"},
     {GSTATE_CALL_OUT_INVITE, "calling"},
     {0,0}
 };
