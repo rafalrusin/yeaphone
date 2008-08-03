@@ -136,14 +136,21 @@ struct Cursor {
 
 enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL};
 
-struct DialPanel {
-    struct NumberEdit numberEdit;
-    struct Cursor cursor;
-    enum MainPanelItem switchTo;
+struct HistoryItem {
+    char number[12];
+    long long callStarted,callEnded;
 };
 
 struct CallPanel {
     int callState;
+    struct HistoryItem callInfo;
+};
+
+struct DialPanel {
+    struct NumberEdit numberEdit;
+    struct Cursor cursor;
+    struct CallPanel *callPanel;
+    enum MainPanelItem switchTo;
 };
 
 enum MenuItem {SEARCH_ITEM, HISTORY_ITEM, VOIP_STATUS_ITEM};
@@ -155,6 +162,8 @@ struct {
 {"history", HISTORY_PANEL},
 {"voip status", DIAL_PANEL}
 };
+
+const char *HISTORY_FILE=".yeaphone_history";
 
 struct MenuPanel {
     enum MenuItem selected;
@@ -175,9 +184,6 @@ struct SearchPanel {
     struct DialPanel *dialPanel;
 };
 
-struct HistoryItem {
-    char number[12];
-};
 
 #define HISTORY_SIZE 100
 
@@ -329,6 +335,7 @@ void dialPanelEvent(struct Event *event, struct DialPanel *dialPanel) {
             if (event->key.value) {
                 if (event->key.c == '@') {
                     lpstates_submit_command(LPCOMMAND_CALL, dialPanel->numberEdit.text);
+                    strcpy(dialPanel->callPanel->callInfo.number, dialPanel->numberEdit.text);
                 }
                 if (event->key.code == K_UP || event->key.code == K_DOWN) {
                     dialPanel->switchTo = MENU_PANEL;
@@ -415,7 +422,14 @@ void searchPanelEvent(struct Event *event, struct SearchPanel *searchPanel) {
 }
 
 void loadHistory(struct HistoryItems *items) {
+    FILE *f = fopen(HISTORY_FILE, "rb");
     items->size = 0;
+    fprintf(stderr,"loadHistory 1\n");
+    if (f) {
+        fseek(f, -HISTORY_SIZE * sizeof(struct HistoryItem), SEEK_END);
+        items->size = fread(items->items, sizeof(*items->items), HISTORY_SIZE, f);
+        fprintf(stderr,"loadHistory 2 items:%i\n",items->size);
+    }
 }
 
 void historyPanelEvent(struct Event *event, struct HistoryPanel *historyPanel) {
@@ -429,7 +443,7 @@ void historyPanelEvent(struct Event *event, struct HistoryPanel *historyPanel) {
         } break;
         case PAINT: {
             if (historyPanel->items.size > 0) {
-                snprintf(event->paint.display->text, 13, "%2i %s", historyPanel->items.size - historyPanel->selected, historyPanel->items.items[historyPanel->selected].number);
+                snprintf(event->paint.display->text, 13, "%2i %s", historyPanel->selected, historyPanel->items.items[historyPanel->selected].number);
             }
         } break;
         case KEY: {
@@ -449,7 +463,7 @@ void historyPanelEvent(struct Event *event, struct HistoryPanel *historyPanel) {
                     historyPanel->switchTo = DIAL_PANEL;
                 }
                 if (historyPanel->items.size > 0) {
-                    historyPanel->selected %= historyPanel->items.size;
+                    historyPanel->selected = (historyPanel->selected + historyPanel->items.size) % historyPanel->items.size;
                 }
             }
         } break;
@@ -507,6 +521,12 @@ const char *getLPStateDesc(int state) {
     return "    ";
 }
 
+void storeCalledNumber(struct HistoryItem *item) {
+    FILE *f=fopen(HISTORY_FILE, "ab");
+    assert(f);
+    fwrite(item, sizeof(*item), 1, f);
+    fclose(f);
+}
 
 void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
     switch (event->type) {
@@ -530,16 +550,21 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         callPanel->callState = event->voip.call;
         event->paint.repaint = 1;
         switch (event->voip.call) {
-            case GSTATE_CALL_OUT_CONNECTED: {
-                yldisp_start_counter();
-            } break;
+            case GSTATE_CALL_OUT_CONNECTED:
             case GSTATE_CALL_IN_CONNECTED: {
                 yldisp_start_counter();
+                callPanel->callInfo.callStarted = now();
             } break;
-            case GSTATE_CALL_IN_INVITE: {
-            } break;
+            case GSTATE_CALL_IN_INVITE:
             case GSTATE_CALL_OUT_INVITE: {
             } break;
+            
+            case GSTATE_CALL_IDLE:
+            case GSTATE_CALL_END: 
+            case GSTATE_CALL_ERROR: {
+                callPanel->callInfo.callEnded = now();
+                storeCalledNumber(&callPanel->callInfo);
+            }
 
             default:break;
         }
@@ -574,6 +599,7 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
         mainPanel->enabled = DIAL_PANEL;
         mainPanel->searchPanel.dialPanel = &mainPanel->dialPanel;
         mainPanel->historyPanel.dialPanel = &mainPanel->dialPanel;
+        mainPanel->dialPanel.callPanel = &mainPanel->callPanel;
     }
     if (event->type == VOIP) {
         //fprintf(stderr,"VOIP\n");
@@ -593,6 +619,7 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
             case GSTATE_CALL_ERROR: 
             if (mainPanel->enabled == CALL_PANEL) {
                 enum MainPanelItem switchTo = DIAL_PANEL;
+                mainPanelChildEvent(event, mainPanel);
                 mainPanelSwitchTo(&switchTo, event, mainPanel);
             }
             default:break;
