@@ -390,7 +390,7 @@ void dialPanelEvent(struct Event *event, struct DialPanel *dialPanel) {
     }
 }
 
-const char *dictionaryFileName = ".dictionary";
+const char *dictionaryFileName = ".yeaphone_dict";
 
 
 void truncateStr(char *str) {
