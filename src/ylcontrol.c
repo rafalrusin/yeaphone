@@ -143,6 +143,7 @@ struct HistoryItem {
 
 struct CallPanel {
     int callState;
+    long long callTimer;
     struct HistoryItem callInfo;
 };
 
@@ -265,6 +266,7 @@ void initTimerAfter(long long period, long long *target) {
 
 
 int checkTimePassed(long long t, struct Event *event) {
+    if (t == 0) return 0;
     if (t<now()) {
         return 1;
     } else {
@@ -566,6 +568,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
     switch (event->type) {
         case INIT: {
             callPanel->callState = -1;
+            callPanel->callTimer = 0;
         } break;
         case PAINT: {
             const char *desc = getEnumDesc(callPanel->callState, callStateDesc);
@@ -577,25 +580,33 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
                         lpstates_submit_command(LPCOMMAND_HANGUP, NULL);
                 }
             }
-                 } break;
-                 default:break;
+        } break;
+        case TIMER: {
+            if (checkTimePassed(callPanel->callTimer, event)) {
+                set_yldisp_ringer(YL_RINGER_ON,1);
+            }
+        } break;
+        default:break;
     }
     if (event->type == VOIP) {
         callPanel->callState = event->voip.call;
         event->paint.repaint = 1;
         switch (event->voip.call) {
-            case GSTATE_CALL_OUT_CONNECTED:
-            case GSTATE_CALL_IN_CONNECTED: {
+            case GSTATE_CALL_IN_CONNECTED: 
+                set_yldisp_ringer(YL_RINGER_OFF,0);
+            case GSTATE_CALL_OUT_CONNECTED: {
                 yldisp_start_counter();
                 callPanel->callInfo.callStarted = now();
             } break;
             case GSTATE_CALL_IN_INVITE:
+                initTimerAfter(170000,&callPanel->callTimer);
             case GSTATE_CALL_OUT_INVITE: {
             } break;
             
             case GSTATE_CALL_IDLE:
             case GSTATE_CALL_END: 
             case GSTATE_CALL_ERROR: {
+                set_yldisp_ringer(YL_RINGER_OFF,0);
                 callPanel->callInfo.callEnded = now();
                 storeCalledNumber(&callPanel->callInfo);
             }
