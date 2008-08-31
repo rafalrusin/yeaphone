@@ -142,7 +142,7 @@ struct HistoryItem {
 };
 
 struct CallPanel {
-    int callState;
+    int callState, connected;
     long long callTimer;
     struct HistoryItem callInfo;
 };
@@ -569,6 +569,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         case INIT: {
             callPanel->callState = -1;
             callPanel->callTimer = 0;
+            callPanel->connected = 0;
         } break;
         case PAINT: {
             const char *desc = getEnumDesc(callPanel->callState, callStateDesc);
@@ -577,13 +578,17 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         case KEY: {
             if (event->key.value) {
                 if (event->key.c == '!') {
-                        lpstates_submit_command(LPCOMMAND_HANGUP, NULL);
-                }
+                    lpstates_submit_command(LPCOMMAND_HANGUP, NULL);
+                } else if (callPanel->callState ==  GSTATE_CALL_IN_INVITE && event->key.c == '@') {
+                    lpstates_submit_command(LPCOMMAND_PICKUP, NULL);
+		        }
             }
         } break;
         case TIMER: {
             if (checkTimePassed(callPanel->callTimer, event)) {
-                set_yldisp_ringer(YL_RINGER_ON,1);
+                if (callPanel->connected == 0) {
+                    set_yldisp_ringer(YL_RINGER_ON,1);
+                }
             }
         } break;
         default:break;
@@ -594,9 +599,11 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         switch (event->voip.call) {
             case GSTATE_CALL_IN_CONNECTED: 
                 set_yldisp_ringer(YL_RINGER_OFF,0);
+                callPanel->connected = 1;
             case GSTATE_CALL_OUT_CONNECTED: {
                 yldisp_start_counter();
                 callPanel->callInfo.callStarted = now();
+                callPanel->connected = 1;
             } break;
             case GSTATE_CALL_IN_INVITE:
                 initTimerAfter(170000,&callPanel->callTimer);
