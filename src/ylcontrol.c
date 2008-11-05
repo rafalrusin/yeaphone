@@ -95,6 +95,7 @@ VOIP_PIPE
 
 struct VoipEvent {
     gstate_t power, call, reg;
+    char message[256];
 };
 
 struct PipeEvent {
@@ -137,13 +138,15 @@ struct Cursor {
 enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL, VOIP_STATUS_PANEL};
 
 struct HistoryItem {
-    char number[12];
+    char number[64];
+    int isOutgoing;
     long long callStarted,callEnded;
 };
 
 struct CallPanel {
     int callState, connected;
     long long callTimer;
+    char incomingNumber[32];
     struct HistoryItem callInfo;
 };
 
@@ -226,6 +229,8 @@ struct EnumDesc voipStatusDesc[] = {
         {0,0}
     };
 
+
+void extract_callernum(char *incomingNumber, const char *line);
 
 void sendPipeEvent(struct PipeEvent *p) {
     fprintf(stderr,"before send %i %i\n",eventPipe[0], eventPipe[1]);
@@ -489,7 +494,7 @@ void historyPanelEvent(struct Event *event, struct HistoryPanel *historyPanel) {
         } break;
         case PAINT: {
             if (historyPanel->items.size > 0) {
-                snprintf(event->paint.display->text, 13, "%2i %s", historyPanel->selected, historyPanel->items.items[historyPanel->selected].number);
+                snprintf(event->paint.display->text, 13, "%2i%c%s", historyPanel->selected, historyPanel->items.items[historyPanel->selected].isOutgoing ? ']' : '[', historyPanel->items.items[historyPanel->selected].number);
             }
         } break;
         case KEY: {
@@ -552,7 +557,7 @@ void menuPanelEvent(struct Event *event, struct MenuPanel *menuPanel) {
 struct EnumDesc callStateDesc[] = {
     {GSTATE_CALL_OUT_CONNECTED, "answered"},
     {GSTATE_CALL_IN_CONNECTED, "answered"},
-    {GSTATE_CALL_IN_INVITE, "ringing"},
+    {GSTATE_CALL_IN_INVITE, "[ "},
     {GSTATE_CALL_OUT_INVITE, "calling"},
     {0,0}
 };
@@ -573,7 +578,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         } break;
         case PAINT: {
             const char *desc = getEnumDesc(callPanel->callState, callStateDesc);
-            snprintf(event->paint.display->text, 13, "%s", desc);
+            snprintf(event->paint.display->text, 13, "%s%s", desc, callPanel->incomingNumber);
         } break;
         case KEY: {
             if (event->key.value) {
@@ -605,9 +610,15 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
                 callPanel->callInfo.callStarted = now();
                 callPanel->connected = 1;
             } break;
-            case GSTATE_CALL_IN_INVITE:
+            case GSTATE_CALL_IN_INVITE: {
+                extract_callernum(callPanel->incomingNumber, event->voip.message);
+                strcpy(callPanel->callInfo.number, callPanel->incomingNumber);
+                callPanel->callInfo.isOutgoing = 0;
                 initTimerAfter(170000,&callPanel->callTimer);
+            } break;
             case GSTATE_CALL_OUT_INVITE: {
+                callPanel->callInfo.isOutgoing = 1;
+                callPanel->incomingNumber[0]=0;
             } break;
             
             case GSTATE_CALL_IDLE:
@@ -616,6 +627,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
                 set_yldisp_ringer(YL_RINGER_OFF,0);
                 callPanel->callInfo.callEnded = now();
                 storeCalledNumber(&callPanel->callInfo);
+                callPanel->incomingNumber[0]=0;
             }
 
             default:break;
@@ -732,7 +744,7 @@ void mainPanelEventWithRepaint(struct Event *event, struct MainPanel *mainPanel)
 
 /**********************************/
 
-void extract_callernum(ylcontrol_data_t *ylc_ptr, const char *line) {
+void extract_callernum(char *incomingNumber, const char *line) {
     int err;
     char *line1 = NULL;
     osip_from_t *url;
@@ -740,14 +752,14 @@ void extract_callernum(ylcontrol_data_t *ylc_ptr, const char *line) {
     char *ptr;
     int what;
     
-    ylc_ptr->callernum[0] = '\0';
+    incomingNumber[0] = '\0';
     
     if (line && line[0]) {
         osip_from_init(&url);
         err = osip_from_parse(url, line);
         what = (err < 0) ? 2 : 0;
         
-        while ((what < 3) && !ylc_ptr->callernum[0]) {
+        while ((what < 3) && !incomingNumber[0]) {
             if (what == 2)
                 line1 = strdup(line);
             
@@ -772,17 +784,6 @@ void extract_callernum(ylcontrol_data_t *ylc_ptr, const char *line) {
                     num++;
                 }
                 else
-                if (!strncmp(num, ylc_ptr->intl_access_code, strlen(ylc_ptr->intl_access_code))) {
-                    /* assume "<intl-access-code><country-code><area-code><local-number>" */
-                    intl = 1;
-                    num += strlen(ylc_ptr->intl_access_code);
-                }
-                else
-                if (!strncmp(num, ylc_ptr->country_code, strlen(ylc_ptr->country_code))) {
-                    /* assume "<country-code><area-code><local-number>" */
-                    intl = 1;
-                }
-
                 /* check if 'num' consists of numbers only */
                 ptr = num;
                 while (ptr && *ptr) {
@@ -796,36 +797,13 @@ void extract_callernum(ylcontrol_data_t *ylc_ptr, const char *line) {
                     continue;
                 }
 
-                if (intl) {
-                    if (!strncmp(num, ylc_ptr->country_code, strlen(ylc_ptr->country_code))) {
-                        /* call from our own country */
-                        /* create "<natl-access-code><area-code><local-number>" */
-                        int left = MAX_NUMBER_LEN-1;
-                        num += strlen(ylc_ptr->country_code);
-                        strncat(ylc_ptr->callernum, ylc_ptr->natl_access_code, left);
-                        left -= strlen(ylc_ptr->natl_access_code);
-                        strncat(ylc_ptr->callernum, num, left);
-                    }
-                    else {
-                        /* call from a foreign country */
-                        /* create "<intl-access-code><country-code><area-code><local-number>" */
-                        int left = MAX_NUMBER_LEN-1;
-                        strncat(ylc_ptr->callernum, ylc_ptr->intl_access_code, left);
-                        left -= strlen(ylc_ptr->intl_access_code);
-                        strncat(ylc_ptr->callernum, num, left);
-                    }
-                }
-                else {
-                    strncat(ylc_ptr->callernum, num, MAX_NUMBER_LEN-1);
-                }
+                strncat(incomingNumber, num, MAX_NUMBER_LEN-1);
             }
         }
         osip_from_free(url);
         if (line1)
          free(line1);
     }
-    
-    /*printf("callernum=%s\n", ylc_ptr->callernum);*/
 }
 
 /**********************************/
@@ -1155,10 +1133,12 @@ void lps_callback(struct _LinphoneCore *lc,
     gstate_t lpstate_call;
     gstate_t lpstate_reg;
     
+    fprintf(stderr,"message: %s\n", gstate->message);
+    dump_lpstate();
+
     lpstate_power = gstate_get_state(GSTATE_GROUP_POWER);
     lpstate_call = gstate_get_state(GSTATE_GROUP_CALL);
     lpstate_reg = gstate_get_state(GSTATE_GROUP_REG);
-    dump_lpstate();
 
     {
         struct PipeEvent event;
@@ -1166,6 +1146,9 @@ void lps_callback(struct _LinphoneCore *lc,
         event.voip.power = lpstate_power;
         event.voip.call = lpstate_call;
         event.voip.reg = lpstate_reg;
+        event.voip.message[0]=0;
+        if (gstate->message)
+            strcpy(event.voip.message, gstate->message);
         sendPipeEvent(&event);
     }
     
