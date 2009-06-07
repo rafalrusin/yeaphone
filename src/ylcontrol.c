@@ -32,6 +32,10 @@
 #include <linux/input.h>
 #include <pthread.h>
 #include <assert.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <linux/kd.h>
+
 
 #include <linphone/linphonecore.h>
 #include <osipparser2/osip_message.h>
@@ -46,6 +50,10 @@
 
 
 #define MAX_NUMBER_LEN 32
+
+#ifndef CLOCK_TICK_RATE
+#define CLOCK_TICK_RATE 1193180
+#endif
 
 
 typedef struct ylcontrol_data_s {
@@ -84,6 +92,7 @@ VOIP
 };
 
 int eventPipe[2];
+int console_fd;
 
 enum KeyCode {K_UP=103,K_IN=105,K_OUT=106,K_DOWN=108};
 
@@ -135,7 +144,7 @@ struct Cursor {
     char cursor;
 };
 
-enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL, VOIP_STATUS_PANEL};
+enum MainPanelItem {NONE, DIAL_PANEL, MENU_PANEL, CALL_PANEL, SEARCH_PANEL, HISTORY_PANEL, VOIP_STATUS_PANEL, EXIT_PANEL};
 
 struct HistoryItem {
     char number[64];
@@ -143,11 +152,33 @@ struct HistoryItem {
     long long callStarted,callEnded;
 };
 
+enum MelodyType {MELODY_DEFAULT='D', MELODY_SPEAKER='S'};
+
+struct MelodyItem {
+    float freq;
+    int delay;
+};
+
+struct Melody {
+    enum MelodyType type;
+    int size;
+    struct MelodyItem *items;
+};
+
+struct MelodyPlayer {
+    int pos;
+    struct Melody *melody;
+    long long timer;
+};
+
 struct CallPanel {
     int callState, connected;
     long long callTimer;
     char incomingNumber[32];
+    int incomingKnown;
     struct HistoryItem callInfo;
+    struct Dictionary *dictionary;
+    struct MelodyPlayer melodyPlayer;
 };
 
 struct DialPanel {
@@ -164,7 +195,8 @@ struct {
 } menuItemDesc[] = { 
 {"search", SEARCH_PANEL},
 {"history", HISTORY_PANEL},
-{"voip status", VOIP_STATUS_PANEL}
+{"voip status", VOIP_STATUS_PANEL},
+{"exit", EXIT_PANEL}
 };
 
 const char *HISTORY_FILE=".yeaphone_history";
@@ -174,15 +206,22 @@ struct MenuPanel {
     enum MainPanelItem switchTo;
 };
 
+
 struct SearchItem {
     char name[13];
     char number[13];
+    struct Melody melody;
 };
 
 #define DICTIONARY_SIZE 100
 
+struct Dictionary {
+    struct Melody defaultMelody;
+    struct SearchItem items[DICTIONARY_SIZE];
+};
+
 struct SearchPanel {
-    struct SearchItem dictionary[DICTIONARY_SIZE];
+    struct Dictionary dictionary;
     struct NumberEdit selected;
     enum MainPanelItem switchTo;
     struct DialPanel *dialPanel;
@@ -230,6 +269,8 @@ struct EnumDesc voipStatusDesc[] = {
     };
 
 
+void beepSpeaker(float freq);
+
 void extract_callernum(char *incomingNumber, const char *line);
 
 void sendPipeEvent(struct PipeEvent *p) {
@@ -270,16 +311,37 @@ void initTimerAfter(long long period, long long *target) {
 }
 
 
-int checkTimePassed(long long t, struct Event *event) {
-    if (t == 0) return 0;
-    if (t<now()) {
+int checkTimePassed(long long *t, struct Event *event) {
+    if (*t == 0) return 0;
+    if (*t<now()) {
+        *t=0;
         return 1;
     } else {
-        if (event->timer.smallestNext > t) {
-            event->timer.smallestNext = t;
+        if (event->timer.smallestNext > *t) {
+            event->timer.smallestNext = *t;
         }
         return 0;
     }
+}
+
+
+void melodyStart(struct MelodyPlayer *player, struct Melody *melody) {
+    player->pos = 0;
+    player->melody = melody;
+    initTimerAfter(0, &player->timer);
+}
+
+void melodyTimerEvent(struct MelodyPlayer *player, struct Event *event) {
+    if (checkTimePassed(&player->timer, event)) {
+        beepSpeaker(player->melody->items[player->pos].freq);
+        initTimerAfter((long long) player->melody->items[player->pos].delay * 1000, &player->timer);
+        player->pos = (player->pos + 1) % player->melody->size;
+    }
+}
+
+void melodyStop(struct MelodyPlayer *player) {
+    player->timer = 0;
+    beepSpeaker(0);
 }
 
 void cursorEvent(struct Event *event, struct Cursor *cursor) {
@@ -289,7 +351,7 @@ void cursorEvent(struct Event *event, struct Cursor *cursor) {
             initTimerAfter(500000,&cursor->nextBlink);
         } break;
         case TIMER: {
-            if (checkTimePassed(cursor->nextBlink, event)) {
+            if (checkTimePassed(&cursor->nextBlink, event)) {
                 initTimerAfter(500000,&cursor->nextBlink);
                 cursor->cursor = '_' == cursor->cursor ? ' ' : '_';
                 event->paint.repaint=1;
@@ -408,25 +470,60 @@ void truncateStr(char *str) {
     }
 }
 
-void loadDictionary(struct SearchItem *items) {
+void loadMelody(struct Melody *melody, FILE *f) {
+    char buf[1024];
+    fscanf(f, "%s", buf);
+    melody->type = buf[0];
+    if (melody->type == MELODY_SPEAKER) {
+        struct MelodyItem melodyItems[1024];
+        melody->size = 0;
+        while (1) {
+            fscanf(f, "%f", &melodyItems[melody->size].freq);
+            if (melodyItems[melody->size].freq == -1) break;
+            fscanf(f, "%i", &melodyItems[melody->size].delay);
+            melody->size ++;
+        }
+        melody->items = (struct MelodyItem *) malloc(sizeof(struct MelodyItem) * melody->size);
+        memcpy(melody->items, melodyItems, sizeof(struct MelodyItem) * melody->size);
+    }
+    //fscanf(f, "\n");
+    fgets(buf,1024,f);
+}
+
+int loadDictionaryItem(struct SearchItem *item, FILE *f) {
+    char buf[1024];
+    //fgets(buf,1024,f);
+    if (fscanf(f, "%[^;];", buf) != 1) return 0;
+    snprintf(item->name, 13, "%s", buf);
+    truncateStr(item->name);
+    fscanf(f, "%[^;];", buf);
+    snprintf(item->number, 13, "%s", buf);
+    truncateStr(item->number);
+
+    loadMelody(&item->melody, f);
+
+//                int j = strlen(buf)-1;
+//                while (j>0 && buf[j]!=';') j--;
+//                buf[j]=0;
+//                snprintf(item->name, 13, "%s", buf);
+//                snprintf(items->number, 13, "%s", buf+j+1);
+//                truncateStr(items->name);
+//                truncateStr(items->number);
+                fprintf(stderr,"loaded %s,%s,%c\n",item->name,item->number,item->melody.type);
+    return 1;
+}
+
+void loadDictionary(struct Dictionary *dictionary) {
     int i;
     FILE *f;
+    struct SearchItem *items = dictionary->items;
     memset(items, 0, sizeof(*items)*DICTIONARY_SIZE);
     f = fopen(dictionaryFileName, "r");
     fprintf(stderr,"loading %p\n",f);
     if (f) {
+        loadMelody(&dictionary->defaultMelody, f);
         for (i=0;i<DICTIONARY_SIZE;i++) {
-            char buf[1024];
-            if (fgets(buf,1024,f)) {
-                int j = strlen(buf)-1;
-                while (j>0 && buf[j]!=';') j--;
-                buf[j]=0;
-                snprintf(items[i].name, 13, "%s", buf);
-                snprintf(items[i].number, 13, "%s", buf+j+1);
-                truncateStr(items[i].name);
-                truncateStr(items[i].number);
-                fprintf(stderr,"loaded %s,%s\n",items[i].name,items[i].number);
-            } else break;    
+            if (!loadDictionaryItem(items+i, f)) break;    
         }
         fclose(f);
     }
@@ -449,10 +546,9 @@ void searchPanelEvent(struct Event *event, struct SearchPanel *searchPanel) {
         case INIT: {
             searchPanel->selected.maxLen = 2;
             searchPanel->selected.flags = NE_USE_UP_DOWN;
-            loadDictionary(searchPanel->dictionary);
         } break;
         case PAINT: {
-            snprintf(event->paint.display->text, 13, "%2i %s", searchPanel->selected.number, searchPanel->dictionary[searchPanel->selected.number].name);
+            snprintf(event->paint.display->text, 13, "%2i %s", searchPanel->selected.number, searchPanel->dictionary.items[searchPanel->selected.number].name);
         } break;
         case KEY: {
             if (event->key.value) {
@@ -462,7 +558,7 @@ void searchPanelEvent(struct Event *event, struct SearchPanel *searchPanel) {
                     event->paint.repaint=1;
                 } else if (event->key.c == '@') {
                     searchPanel->switchTo = DIAL_PANEL;
-                    strcpy(searchPanel->dialPanel->numberEdit.initialNumber, searchPanel->dictionary[searchPanel->selected.number].number);
+                    strcpy(searchPanel->dialPanel->numberEdit.initialNumber, searchPanel->dictionary.items[searchPanel->selected.number].number);
                 } else if (event->key.c == '!') {
                     searchPanel->switchTo = DIAL_PANEL;
                 }
@@ -569,16 +665,58 @@ void storeCalledNumber(struct HistoryItem *item) {
     fclose(f);
 }
 
+void beepSpeaker(float freq) {
+    fprintf(stderr, "beepSpeaker %i\n", freq); 
+    if (freq) {
+           /* BEEP_TYPE_EVDEV */
+           struct input_event e;
+      
+           e.type = EV_SND;
+           e.code = SND_TONE;
+           e.value = freq;
+      
+           write(console_fd, &e, sizeof(struct input_event));
+
+    } else {
+           /* BEEP_TYPE_EVDEV */
+           struct input_event e;
+      
+           e.type = EV_SND;
+           e.code = SND_TONE;
+           e.value = 0;
+      
+           write(console_fd, &e, sizeof(struct input_event));
+    }
+}
+
+void ring(int v) {
+    if (v) {
+        set_yldisp_ringer(YL_RINGER_ON,1);
+    } else {
+        set_yldisp_ringer(YL_RINGER_OFF,0);
+    }
+}
+
+int findIncomingKnown(char *incomingNumber, struct Dictionary *dictionary) {
+    int i;
+    for (i=0;i<DICTIONARY_SIZE;i++) {
+        if (strcmp(incomingNumber, dictionary->items[i].number) == 0) return i;
+    }
+    return -1;
+}
+
 void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
     switch (event->type) {
         case INIT: {
             callPanel->callState = -1;
             callPanel->callTimer = 0;
             callPanel->connected = 0;
+            callPanel->incomingKnown = -1;
+            melodyStop(&callPanel->melodyPlayer);
         } break;
         case PAINT: {
             const char *desc = getEnumDesc(callPanel->callState, callStateDesc);
-            snprintf(event->paint.display->text, 13, "%s%s", desc, callPanel->incomingNumber);
+            snprintf(event->paint.display->text, 13, "%s%s", desc, callPanel->incomingKnown == -1 ? callPanel->incomingNumber : callPanel->dictionary->items[callPanel->incomingKnown].name);
         } break;
         case KEY: {
             if (event->key.value) {
@@ -586,15 +724,26 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
                     lpstates_submit_command(LPCOMMAND_HANGUP, NULL);
                 } else if (callPanel->callState ==  GSTATE_CALL_IN_INVITE && event->key.c == '@') {
                     lpstates_submit_command(LPCOMMAND_PICKUP, NULL);
-		        }
+                }
             }
         } break;
         case TIMER: {
-            if (checkTimePassed(callPanel->callTimer, event)) {
+            if (checkTimePassed(&callPanel->callTimer, event)) {
                 if (callPanel->connected == 0) {
-                    set_yldisp_ringer(YL_RINGER_ON,1);
+                    struct Melody* melody;
+                    if (callPanel->incomingKnown == -1) {
+                        melody = &callPanel->dictionary->defaultMelody;
+                    } else {
+                        melody = &callPanel->dictionary->items[callPanel->incomingKnown].melody;
+                    }
+                    if (melody->type == MELODY_DEFAULT) {
+                        ring(1);
+                    } else {
+                        melodyStart(&callPanel->melodyPlayer, melody);
+                    }
                 }
             }
+            melodyTimerEvent(&callPanel->melodyPlayer, event);
         } break;
         default:break;
     }
@@ -603,7 +752,8 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
         event->paint.repaint = 1;
         switch (event->voip.call) {
             case GSTATE_CALL_IN_CONNECTED: 
-                set_yldisp_ringer(YL_RINGER_OFF,0);
+                ring(0);
+                melodyStop(&callPanel->melodyPlayer);
                 callPanel->connected = 1;
             case GSTATE_CALL_OUT_CONNECTED: {
                 yldisp_start_counter();
@@ -612,6 +762,7 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
             } break;
             case GSTATE_CALL_IN_INVITE: {
                 extract_callernum(callPanel->incomingNumber, event->voip.message);
+                callPanel->incomingKnown = findIncomingKnown(callPanel->incomingNumber, callPanel->dictionary);
                 strcpy(callPanel->callInfo.number, callPanel->incomingNumber);
                 callPanel->callInfo.isOutgoing = 0;
                 initTimerAfter(170000,&callPanel->callTimer);
@@ -624,7 +775,9 @@ void callPanelEvent(struct Event *event, struct CallPanel *callPanel) {
             case GSTATE_CALL_IDLE:
             case GSTATE_CALL_END: 
             case GSTATE_CALL_ERROR: {
-                set_yldisp_ringer(YL_RINGER_OFF,0);
+                ring(0);
+                melodyStop(&callPanel->melodyPlayer);
+
                 callPanel->callInfo.callEnded = now();
                 storeCalledNumber(&callPanel->callInfo);
                 callPanel->incomingNumber[0]=0;
@@ -665,6 +818,8 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
         mainPanel->searchPanel.dialPanel = &mainPanel->dialPanel;
         mainPanel->historyPanel.dialPanel = &mainPanel->dialPanel;
         mainPanel->dialPanel.callPanel = &mainPanel->callPanel;
+        loadDictionary(&mainPanel->searchPanel.dictionary);
+        mainPanel->callPanel.dictionary = &mainPanel->searchPanel.dictionary;
     }
     if (event->type == VOIP) {
         //fprintf(stderr,"VOIP\n");
@@ -698,6 +853,7 @@ void mainPanelEvent(struct Event *event, struct MainPanel *mainPanel) {
         case SEARCH_PANEL: mainPanelSwitchTo(&mainPanel->searchPanel.switchTo, event, mainPanel); break;
         case HISTORY_PANEL: mainPanelSwitchTo(&mainPanel->historyPanel.switchTo, event, mainPanel); break;
         case VOIP_STATUS_PANEL: mainPanelSwitchTo(&mainPanel->voipStatusPanel.switchTo, event, mainPanel); break;
+        case EXIT_PANEL: exit(0); break;
 
         case NONE:
         case CALL_PANEL:
@@ -1393,6 +1549,8 @@ void init_ylcontrol(char *countrycode) {
     assert(pipe(eventPipe)==0);
     fprintf(stderr,"init eventPipe read:%i write:%i\n",eventPipe[0], eventPipe[1]);
     pthread_mutex_init(&panelMutex, NULL);
+
+    console_fd = open("/dev/input/event0", O_WRONLY);
     
     {
         struct Event event;
