@@ -1,0 +1,3 @@
+D ; this is default melody - phone ringing
+name1;1234567;S 440 500 0 500 -1 ; this is entry with nslu2 speaker melody
+name2;1234568;D ; this is entry with default phone ringing
