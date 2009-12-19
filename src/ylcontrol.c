@@ -218,6 +218,7 @@ struct SearchItem {
 struct Dictionary {
     struct Melody defaultMelody;
     struct SearchItem items[DICTIONARY_SIZE];
+    int size;
 };
 
 struct SearchPanel {
@@ -473,6 +474,7 @@ void truncateStr(char *str) {
 void loadMelody(struct Melody *melody, FILE *f) {
     char buf[1024];
     fscanf(f, "%s", buf);
+    fprintf(stderr,"loadMelody str '%s'\n", buf);
     melody->type = buf[0];
     if (melody->type == MELODY_SPEAKER) {
         struct MelodyItem melodyItems[1024];
@@ -523,20 +525,14 @@ void loadDictionary(struct Dictionary *dictionary) {
     if (f) {
         loadMelody(&dictionary->defaultMelody, f);
         for (i=0;i<DICTIONARY_SIZE;i++) {
-            if (!loadDictionaryItem(items+i, f)) break;    
+            if (loadDictionaryItem(items+i, f)) {
+                dictionary->size++;
+            } else {
+                break;    
+            }
         }
         fclose(f);
     }
-}
-
-void saveDictionary(struct SearchItem *items) {
-    int i;
-    FILE *f;
-    f = fopen(dictionaryFileName, "w");
-    for (i=0;i<DICTIONARY_SIZE;i++) {
-        fprintf(f, "%s %s\n", items[i].name, items[i].number);
-    }
-    fclose(f);
 }
 
 void searchPanelEvent(struct Event *event, struct SearchPanel *searchPanel) {
@@ -699,7 +695,7 @@ void ring(int v) {
 
 int findIncomingKnown(char *incomingNumber, struct Dictionary *dictionary) {
     int i;
-    for (i=0;i<DICTIONARY_SIZE;i++) {
+    for (i=0;i<dictionary->size;i++) {
         if (strcmp(incomingNumber, dictionary->items[i].number) == 0) return i;
     }
     return -1;
